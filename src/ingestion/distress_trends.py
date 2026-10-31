@@ -20,6 +20,40 @@ CFPB_30_89_URL = "https://files.consumerfinance.gov/data/mortgage-performance/do
 
 TARGET_COUNTIES = ["Gwinnett County", "Fulton County", "DeKalb County", "Cobb County", "Forsyth County"]
 
+# Citable metadata for every external dataset shown on the distress dashboard
+DATA_SOURCES: Dict[str, Dict[str, str]] = {
+    "evictions": {
+        "name": "Fulton County Eviction (Dispossessory) Filings",
+        "publisher": "Fulton County Open Data Portal",
+        "page_url": "https://data.fultoncountyga.gov/d/cbu2-qs5w",
+        "api_url": "https://data.fultoncountyga.gov/resource/cbu2-qs5w.json",
+        "coverage": "Fulton County only · monthly filings",
+        "frequency": "Monthly",
+        "notes": "Counts court filings, not completed evictions. Gwinnett/DeKalb/Cobb are not included.",
+    },
+    "mortgage_delinquency": {
+        "name": "Mortgage Performance Trends (90+ & 30–89 Days Delinquent)",
+        "publisher": "Consumer Financial Protection Bureau (CFPB) · National Mortgage Database",
+        "page_url": "https://www.consumerfinance.gov/data-research/mortgage-performance-trends/",
+        "api_url": "https://www.consumerfinance.gov/data-research/mortgage-performance-trends/download-the-data/",
+        "coverage": "Gwinnett, Fulton, DeKalb, Cobb, Forsyth counties · monthly",
+        "frequency": "Quarterly releases (monthly series)",
+        "notes": "Share of mortgages 90+ days late — a leading indicator of the foreclosure pipeline, not a count of foreclosure filings.",
+    },
+    "ga_legal_notices": {
+        "name": "Georgia Trustee Foreclosure & Courthouse Auction Notices",
+        "publisher": "Rubin Lublin, LLC (RLSE Law) & Auction.com",
+        "page_url": "https://rlselaw.com/property-listing/georgia-property-listings/",
+        "api_url": "https://www.auction.com/search/residential/ga/",
+        "coverage": "Fulton, Gwinnett, Cobb, DeKalb, Forsyth & Metro Atlanta counties",
+        "frequency": "Continuous / Weekly updates",
+        "notes": "Official non-judicial foreclosure auction notices advertised pursuant to Georgia law prior to first-Tuesday courthouse auctions.",
+    },
+}
+
+# Records whether each dataset was last loaded from the live endpoint or the local cache
+FETCH_STATUS: Dict[str, str] = {"evictions": "unavailable", "mortgage_delinquency": "unavailable"}
+
 
 def fetch_historical_eviction_filings() -> pd.DataFrame:
     """
@@ -46,6 +80,7 @@ def fetch_historical_eviction_filings() -> pd.DataFrame:
                 CACHE_DIR.mkdir(parents=True, exist_ok=True)
                 df[["date", "year", "month", "filings", "county", "source"]].to_csv(cache_file, index=False)
                 logger.info(f"Successfully fetched {len(df)} monthly eviction records from Fulton Socrata API.")
+                FETCH_STATUS["evictions"] = "live"
                 return df
     except Exception as ex:
         logger.warning(f"Failed to fetch live eviction filings from API: {ex}")
@@ -55,6 +90,7 @@ def fetch_historical_eviction_filings() -> pd.DataFrame:
         logger.info("Loading eviction filings from local cache.")
         df = pd.read_csv(cache_file)
         df["date"] = pd.to_datetime(df["date"])
+        FETCH_STATUS["evictions"] = "cache"
         return df
 
     return pd.DataFrame(columns=["date", "year", "month", "filings", "county", "source"])
@@ -104,6 +140,7 @@ def fetch_historical_mortgage_delinquency() -> pd.DataFrame:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             clean_df.to_csv(cache_file, index=False)
             logger.info(f"Successfully processed {len(clean_df)} CFPB mortgage delinquency records.")
+            FETCH_STATUS["mortgage_delinquency"] = "live"
             return clean_df
 
     except Exception as ex:
@@ -114,6 +151,7 @@ def fetch_historical_mortgage_delinquency() -> pd.DataFrame:
         logger.info("Loading CFPB delinquency data from local cache.")
         df = pd.read_csv(cache_file)
         df["date"] = pd.to_datetime(df["date"])
+        FETCH_STATUS["mortgage_delinquency"] = "cache"
         return df
 
     return pd.DataFrame(columns=["county", "date", "year", "month", "late_90_plus_pct", "late_30_89_pct"])

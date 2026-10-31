@@ -309,5 +309,57 @@ def test_compute_price_drop_summary_velocity():
         assert "velocity_tag" in target
 
 
+def test_rental_pipeline_and_repository():
+    from src.database.models import RentalListing
+    from src.ingestion.pipeline import ingest_rental_records
+    from src.database.repository import get_rentals_dataframe
+
+    # Clean up test rental
+    with get_session() as session:
+        session.query(RentalListing).filter(RentalListing.property_id == "TEST-RENTAL-001").delete()
+        session.commit()
+
+    sample_rental = [
+        {
+            "property_id": "TEST-RENTAL-001",
+            "property_url": "https://www.realtor.com/apartments/test-001",
+            "formatted_address": "456 Test Apt Blvd Unit 101, Duluth, GA 30096",
+            "street": "456 Test Apt Blvd",
+            "unit": "101",
+            "city": "Duluth",
+            "state": "GA",
+            "zip_code": "30096",
+            "county": "Gwinnett",
+            "beds": 2.0,
+            "full_baths": 2.0,
+            "sqft": 1100.0,
+            "style": "APARTMENT",
+            "monthly_rent": 1850.0,
+            "rent_min": 1750.0,
+            "rent_max": 1950.0,
+            "days_on_market": 5,
+            "listing_source": "Realtor Rentals"
+        }
+    ]
+
+    res = ingest_rental_records(sample_rental, source_name="test_rentals")
+    assert res["status"] == "success"
+    assert res["inserted"] == 1
+
+    # Query via repository dataframe
+    df = get_rentals_dataframe(cities=["Duluth"], min_beds=2)
+    assert not df.empty
+    match = df[df["property_id"] == "TEST-RENTAL-001"]
+    assert len(match) == 1
+    assert match.iloc[0]["monthly_rent"] == 1850.0
+    assert match.iloc[0]["rent_per_sqft"] == round(1850.0 / 1100.0, 2)
+
+    # Cleanup
+    with get_session() as session:
+        session.query(RentalListing).filter(RentalListing.property_id == "TEST-RENTAL-001").delete()
+        session.commit()
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
+

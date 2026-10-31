@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 
 from sqlalchemy.orm import Session
 from src.database.connection import get_session
-from src.database.models import Property, PriceHistory, AlertRule, AlertLog, IngestionSnapshot
+from src.database.models import Property, PriceHistory, AlertRule, AlertLog, IngestionSnapshot, RentalListing
 from src.ingestion.scraper import scrape_metro_atlanta_submarkets
 from src.ingestion.mock_generator import generate_metro_atlanta_listings
 
@@ -337,3 +337,101 @@ def run_pipeline(
 
     combined_source_name = "+".join(source_labels) if source_labels else source
     return ingest_records(all_records, source_name=combined_source_name)
+
+
+def ingest_rental_records(records: List[Dict[str, Any]], source_name: str = "Realtor Rentals") -> Dict[str, Any]:
+    """
+    Ingest, deduplicate, and upsert apartment and rental listings into the rental_listings table.
+    """
+    now = datetime.now(timezone.utc)
+    inserted_count = 0
+    updated_count = 0
+
+    with get_session() as session:
+        for rec in records:
+            prop_id = rec.get("property_id")
+            address = (rec.get("formatted_address") or "").strip()
+            zip_code = (rec.get("zip_code") or "").strip()[:5]
+            monthly_rent = float(rec.get("monthly_rent") or 0.0)
+
+            if monthly_rent <= 0 or not address:
+                continue
+
+            # Deduplication: match by property_id or formatted_address
+            existing = None
+            if prop_id:
+                existing = session.query(RentalListing).filter(RentalListing.property_id == prop_id).first()
+            if not existing and address:
+                existing = session.query(RentalListing).filter(RentalListing.formatted_address == address).first()
+
+            sqft = float(rec.get("sqft") or 0.0)
+            rent_sqft = rec.get("rent_per_sqft") or (round(monthly_rent / sqft, 2) if sqft > 0 else None)
+
+            if existing:
+                existing.monthly_rent = monthly_rent
+                existing.rent_min = rec.get("rent_min") or monthly_rent
+                existing.rent_max = rec.get("rent_max") or monthly_rent
+                existing.rent_per_sqft = rent_sqft
+                existing.last_seen_date = now
+                if rec.get("beds") is not None:
+                    existing.beds = rec.get("beds")
+                if rec.get("full_baths") is not None:
+                    existing.full_baths = rec.get("full_baths")
+                if rec.get("sqft") is not None and rec.get("sqft") > 0:
+                    existing.sqft = rec.get("sqft")
+                if rec.get("primary_photo"):
+                    existing.primary_photo = rec.get("primary_photo")
+                if rec.get("property_url"):
+                    existing.property_url = rec.get("property_url")
+                updated_count += 1
+            else:
+                rental = RentalListing(
+                    property_id=prop_id,
+                    property_url=rec.get("property_url"),
+                    formatted_address=address,
+                    street=rec.get("street"),
+                    unit=rec.get("unit"),
+                    city=rec.get("city", "Duluth"),
+                    state=rec.get("state", "GA"),
+                    zip_code=zip_code,
+                    county=rec.get("county", "Gwinnett"),
+                    beds=rec.get("beds"),
+                    full_baths=rec.get("full_baths"),
+                    half_baths=rec.get("half_baths"),
+                    sqft=sqft if sqft > 0 else None,
+                    style=rec.get("style", "APARTMENT"),
+                    monthly_rent=monthly_rent,
+                    rent_min=rec.get("rent_min") or monthly_rent,
+                    rent_max=rec.get("rent_max") or monthly_rent,
+                    rent_per_sqft=rent_sqft,
+                    days_on_market=rec.get("days_on_market", 0),
+                    latitude=rec.get("latitude"),
+                    longitude=rec.get("longitude"),
+                    primary_photo=rec.get("primary_photo"),
+                    listing_source=rec.get("listing_source", "Realtor Rentals"),
+                    first_seen_date=now,
+                    last_seen_date=now
+                )
+                session.add(rental)
+                inserted_count += 1
+
+        session.commit()
+
+    return {
+        "status": "success",
+        "inserted": inserted_count,
+        "updated": updated_count,
+        "total_processed": len(records)
+    }
+
+
+def run_rental_pipeline(
+    submarkets: Optional[List[str]] = None,
+    limit_per_zip: int = 25
+) -> Dict[str, Any]:
+    """
+    Run scraper for apartment rentals across submarkets and ingest into rental_listings.
+    """
+    from src.ingestion.scraper import scrape_apartment_rentals
+    records = scrape_apartment_rentals(submarkets=submarkets, limit_per_zip=limit_per_zip)
+    return ingest_rental_records(records, source_name="Realtor Rentals")

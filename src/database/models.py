@@ -207,3 +207,73 @@ class IngestionSnapshot(Base):
             "alerts_triggered": self.alerts_triggered,
             "notes": self.notes
         }
+
+
+class RentalListing(Base):
+    __tablename__ = "rental_listings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    property_id = Column(String(64), index=True, nullable=True)
+    property_url = Column(Text, nullable=True)
+    formatted_address = Column(String(255), nullable=False)
+    street = Column(String(255), nullable=True)
+    unit = Column(String(64), nullable=True)
+    city = Column(String(64), index=True, nullable=False)
+    state = Column(String(16), default="GA", nullable=False)
+    zip_code = Column(String(16), index=True, nullable=False)
+    county = Column(String(64), nullable=True)
+
+    beds = Column(Float, nullable=True)
+    full_baths = Column(Float, nullable=True)
+    half_baths = Column(Float, nullable=True)
+    sqft = Column(Float, nullable=True)
+    style = Column(String(64), default="APARTMENT")  # APARTMENT, TOWNHOMES, CONDO, SINGLE_FAMILY
+
+    monthly_rent = Column(Float, nullable=False)  # Representative or average monthly rent
+    rent_min = Column(Float, nullable=True)
+    rent_max = Column(Float, nullable=True)
+    rent_per_sqft = Column(Float, nullable=True)
+    days_on_market = Column(Integer, default=0)
+
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    primary_photo = Column(Text, nullable=True)
+    listing_source = Column(String(64), default="Realtor Rentals", index=True)
+
+    first_seen_date = Column(DateTime, default=utc_now, nullable=False)
+    last_seen_date = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    __table_args__ = (
+        Index("ix_rentals_city_zip", "city", "zip_code"),
+        Index("ix_rentals_rent_beds", "monthly_rent", "beds"),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "property_id": self.property_id,
+            "property_url": self.property_url,
+            "formatted_address": self.formatted_address,
+            "street": self.street,
+            "unit": self.unit,
+            "city": self.city,
+            "state": self.state,
+            "zip_code": self.zip_code,
+            "county": self.county,
+            "beds": self.beds,
+            "full_baths": self.full_baths,
+            "half_baths": self.half_baths,
+            "sqft": self.sqft,
+            "style": self.style or "APARTMENT",
+            "monthly_rent": self.monthly_rent,
+            "rent_min": self.rent_min,
+            "rent_max": self.rent_max,
+            "rent_per_sqft": self.rent_per_sqft,
+            "days_on_market": self.days_on_market,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "primary_photo": self.primary_photo,
+            "listing_source": self.listing_source or "Realtor Rentals",
+            "first_seen_date": self.first_seen_date.isoformat() if self.first_seen_date else None,
+            "last_seen_date": self.last_seen_date.isoformat() if self.last_seen_date else None,
+        }

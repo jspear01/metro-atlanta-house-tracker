@@ -11,8 +11,8 @@ from datetime import datetime
 
 from src.config import TARGET_SUBMARKETS, ALL_ZIP_CODES
 from src.database.connection import get_session, init_db
-from src.database.models import Property, PriceHistory, AlertRule, AlertLog, IngestionSnapshot
-from src.database.repository import query_properties, get_recent_alerts, get_alert_rules
+from src.database.models import Property, PriceHistory, AlertRule, AlertLog, IngestionSnapshot, RentalListing
+from src.database.repository import query_properties, get_recent_alerts, get_alert_rules, get_rentals_dataframe
 from src.analytics.metrics import (
     get_properties_dataframe,
     compute_executive_kpis,
@@ -23,16 +23,38 @@ from src.analytics.metrics import (
     compute_mortgage_delinquency_metrics,
     compute_price_drop_summary
 )
-from src.ingestion.pipeline import run_pipeline
+from src.ingestion.pipeline import run_pipeline, run_rental_pipeline
 from src.ingestion.distress_trends import (
     fetch_historical_eviction_filings,
-    fetch_historical_mortgage_delinquency
+    fetch_historical_mortgage_delinquency,
+    DATA_SOURCES,
+    FETCH_STATUS
 )
 
 
 def md_escape(text) -> str:
     """Escape '$' so Streamlit markdown doesn't render text between dollar signs as LaTeX."""
     return str(text).replace("$", "\\$")
+
+
+# Known listing origin websites: domain fragment -> (display name, badge color)
+LISTING_SITES = {
+    "realtor.com": ("Realtor.com", "#f87171"),
+    "redfin.com": ("Redfin", "#fb7185"),
+    "zillow.com": ("Zillow", "#60a5fa"),
+    "auction.com": ("Auction.com", "#a78bfa"),
+    "rlselaw.com": ("RLSE Law (GA Trustee Notices)", "#c4b5fd"),
+}
+
+
+def get_listing_site(url, feed_name=None) -> tuple:
+    """Return (site display name, badge color) based on the listing URL's domain."""
+    url_str = str(url or "").lower()
+    for domain, (name, color) in LISTING_SITES.items():
+        if domain in url_str:
+            return name, color
+    return (feed_name or "Unknown Source"), "#94a3b8"
+
 
 
 def is_synthetic_listing(prop: dict) -> bool:
@@ -200,10 +222,11 @@ def render_dashboard():
     st.markdown("---")
 
     # Navigation Tabs
-    tab_overview, tab_valuation, tab_listings, tab_distress, tab_deals, tab_pipeline = st.tabs([
+    tab_overview, tab_valuation, tab_listings, tab_rentals, tab_distress, tab_deals, tab_pipeline = st.tabs([
         "📊 Market Overview",
         "📉 Price vs. SqFt Valuation",
         "🏡 Property Listings",
+        "🏢 Apartments & Rentals",
         "⚖️ Eviction & Foreclosure Trends",
         "🎯 Price Drop Alerts & Rules",
         "⚡ Ingestion & Live Scraper"
@@ -377,8 +400,32 @@ def render_dashboard():
             else:
                 sorted_df = df.sort_values(by="current_list_price", ascending=False)
 
-            # Display top 15 listings in responsive grid
-            top_listings = sorted_df.head(15).to_dict(orient="records")
+            # Paginate listings so every filtered property is reachable
+            total_listings = len(sorted_df)
+
+            def _set_listings_page(target_page: int) -> None:
+                st.session_state["listings_page_num"] = target_page
+
+            pg_col1, pg_col2 = st.columns([1, 3])
+            with pg_col1:
+                page_size = st.selectbox(
+                    "Listings per page",
+                    [15, 30, 50, 100],
+                    index=0,
+                    key="listings_page_size",
+                    on_change=_set_listings_page,
+                    args=(1,)
+                )
+            total_pages = max(1, -(-total_listings // page_size))
+            page_num = min(max(1, int(st.session_state.get("listings_page_num", 1))), total_pages)
+            st.session_state["listings_page_num"] = page_num
+            start_idx = (page_num - 1) * page_size
+            end_idx = min(start_idx + page_size, total_listings)
+            with pg_col2:
+                st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+                st.caption(f"Page **{page_num}** of **{total_pages}** · Showing **{start_idx + 1}–{end_idx}** of **{total_listings}** listings")
+
+            top_listings = sorted_df.iloc[start_idx:end_idx].to_dict(orient="records")
             for prop in top_listings:
                 with st.container():
                     p_col1, p_col2 = st.columns([1, 3])
@@ -408,14 +455,13 @@ def render_dashboard():
                             badges.append(
                                 "<span style='background-color:#7c3aed;color:#ffffff;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:700;display:inline-block;'>🏛️ Courthouse Auction / Notice</span>"
                             )
-                        elif prop.get("listing_source") == "Redfin Open Data":
-                            badges.append(
-                                "<span style='background-color:#e11d48;color:#ffffff;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:700;display:inline-block;'>📊 Redfin Open Data</span>"
-                            )
-                        elif prop.get("listing_source") and prop.get("listing_source") != "MLS/Realtor":
-                            badges.append(
-                                f"<span style='background-color:#475569;color:#ffffff;padding:4px 8px;border-radius:6px;font-size:11px;font-weight:600;display:inline-block;'>{prop['listing_source']}</span>"
-                            )
+
+                        # Source badge: origin website (from listing URL) + ingestion feed
+                        site_name, site_color = get_listing_site(prop.get("property_url"), prop.get("listing_source"))
+                        feed_name = prop.get("listing_source") or "MLS/Realtor"
+                        badges.append(
+                            f"<span title='Ingestion feed: {feed_name}' style='background-color:transparent;color:{site_color};border:1px solid {site_color};padding:3px 10px;border-radius:6px;font-size:12px;font-weight:700;display:inline-block;'>🔗 Source: {site_name} · {feed_name}</span>"
+                        )
 
                         badges_html = f"<div style='display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;'>{''.join(badges)}</div>"
                         st.html(badges_html)
@@ -428,17 +474,348 @@ def render_dashboard():
                         
                         listing_url = prop.get("property_url")
                         if listing_url and str(listing_url).strip() and str(listing_url) != "None":
-                            st.link_button("View External MLS Listing ↗", listing_url, type="primary")
+                            st.link_button(f"View on {site_name} ↗", listing_url, type="primary")
                         else:
                             st.link_button("View Submarket MLS Search ↗", f"https://www.realtor.com/realestateandhomes-search/{prop['zip_code']}", type="secondary")
                     st.divider()
 
+            # Bottom numbered pager (synced with the top page input via session state)
+            if total_pages > 1:
+                current_page = int(page_num)
+                window = 2
+                page_items = []
+                for p in range(1, total_pages + 1):
+                    if p == 1 or p == total_pages or abs(p - current_page) <= window:
+                        page_items.append(p)
+                    elif page_items and page_items[-1] != "…":
+                        page_items.append("…")
+
+                slots = ["prev"] + page_items + ["next"]
+                _, pager_center, _ = st.columns([1, 4, 1])
+                with pager_center:
+                    pager_cols = st.columns(len(slots))
+                    for i, item in enumerate(slots):
+                        with pager_cols[i]:
+                            if item == "prev":
+                                st.button(
+                                    "‹ Prev", key="listings_pager_prev", width="stretch",
+                                    disabled=current_page <= 1,
+                                    on_click=_set_listings_page, args=(current_page - 1,)
+                                )
+                            elif item == "next":
+                                st.button(
+                                    "Next ›", key="listings_pager_next", width="stretch",
+                                    disabled=current_page >= total_pages,
+                                    on_click=_set_listings_page, args=(current_page + 1,)
+                                )
+                            elif item == "…":
+                                st.markdown("<div style='text-align:center;padding-top:6px;color:#94a3b8;'>…</div>", unsafe_allow_html=True)
+                            else:
+                                st.button(
+                                    str(item), key=f"listings_pager_{item}", width="stretch",
+                                    type="primary" if item == current_page else "secondary",
+                                    on_click=_set_listings_page, args=(item,)
+                                )
+                st.caption(f"<div style='text-align:center;'>Page {current_page} of {total_pages} · Showing {start_idx + 1}–{end_idx} of {total_listings} listings</div>", unsafe_allow_html=True)
+
     # ----------------------------------------------------
-    # TAB 4: Eviction & Foreclosure Trends
+    # TAB 4: Apartments & Rentals
+    # ----------------------------------------------------
+    with tab_rentals:
+        st.subheader("🏢 Metro Atlanta Apartment & Rental Tracker")
+        st.caption(
+            "Live multi-family communities, apartment complexes, and rental properties scraped across Duluth, Suwanee, Norcross, Alpharetta, Atlanta, and surrounding North Metro submarkets."
+        )
+
+        # Rental Submarket / Parameter Filters Bar
+        r_fcol1, r_fcol2, r_fcol3, r_fcol4 = st.columns([1.2, 1.2, 1.2, 1.4])
+        with r_fcol1:
+            rent_beds_filter = st.selectbox(
+                "Bedroom Minimum",
+                ["All Bedrooms", "1+ Beds", "2+ Beds", "3+ Beds", "4+ Beds"],
+                index=0,
+                key="rent_beds_filter"
+            )
+        with r_fcol2:
+            rent_max_slider = st.slider(
+                "Max Monthly Rent ($)",
+                min_value=800,
+                max_value=5000,
+                value=4000,
+                step=100,
+                format="$%d/mo",
+                key="rent_max_slider"
+            )
+        with r_fcol3:
+            rent_sort_option = st.selectbox(
+                "Sort Rentals By",
+                [
+                    "Rent: Low to High",
+                    "Rent: High to Low",
+                    "Lowest $/SqFt",
+                    "Newest / Lowest DOM",
+                    "Most Bedrooms"
+                ],
+                index=0,
+                key="rent_sort_option"
+            )
+        with r_fcol4:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if st.button("🔄 Scrape / Refresh Rentals", key="refresh_rentals_btn", width="stretch"):
+                with st.spinner("Scraping live apartment listings from Realtor.com Rentals..."):
+                    res = run_rental_pipeline(
+                        submarkets=selected_cities if selected_cities else ["Duluth", "Suwanee", "Norcross", "Alpharetta", "Atlanta"],
+                        limit_per_zip=15
+                    )
+                    st.success(f"Ingested {res.get('inserted', 0)} new and updated {res.get('updated', 0)} rental records!")
+                    st.rerun()
+
+        # Query Rental Dataframe
+        min_beds_val = None
+        if rent_beds_filter == "1+ Beds":
+            min_beds_val = 1
+        elif rent_beds_filter == "2+ Beds":
+            min_beds_val = 2
+        elif rent_beds_filter == "3+ Beds":
+            min_beds_val = 3
+        elif rent_beds_filter == "4+ Beds":
+            min_beds_val = 4
+
+        raw_rentals_df = get_rentals_dataframe(
+            cities=selected_cities if selected_cities else None,
+            zip_codes=selected_zips if selected_zips else None,
+            min_beds=min_beds_val,
+            max_rent=rent_max_slider
+        )
+
+        if raw_rentals_df.empty:
+            st.warning("No rental properties found matching current filter criteria. Try expanding your search or clicking '🔄 Scrape / Refresh Rentals'.")
+        else:
+            # Rental Executive KPI Strip
+            total_rentals = len(raw_rentals_df)
+            median_rent = raw_rentals_df["monthly_rent"].median() if not raw_rentals_df["monthly_rent"].empty else 0
+            min_rent = raw_rentals_df["monthly_rent"].min() if not raw_rentals_df["monthly_rent"].empty else 0
+            max_rent = raw_rentals_df["monthly_rent"].max() if not raw_rentals_df["monthly_rent"].empty else 0
+            sqft_mask = raw_rentals_df["rent_per_sqft"].notna() & (raw_rentals_df["rent_per_sqft"] > 0)
+            median_rent_sqft = raw_rentals_df.loc[sqft_mask, "rent_per_sqft"].median() if sqft_mask.any() else 0.0
+            
+            top_city = raw_rentals_df["city"].value_counts().index[0] if "city" in raw_rentals_df.columns and not raw_rentals_df.empty else "N/A"
+            top_city_count = raw_rentals_df["city"].value_counts().iloc[0] if "city" in raw_rentals_df.columns and not raw_rentals_df.empty else 0
+
+            rk1, rk2, rk3, rk4, rk5 = st.columns(5)
+            rk1.metric("Active Rentals", f"{total_rentals:,} units")
+            rk2.metric("Median Rent", f"${median_rent:,.0f} / mo" if median_rent > 0 else "N/A")
+            rk3.metric("Rent Range", f"${min_rent:,.0f} – ${max_rent:,.0f}" if min_rent > 0 else "N/A")
+            rk4.metric("Median Rent / SqFt", f"${median_rent_sqft:.2f} / sqft" if median_rent_sqft > 0 else "N/A")
+            rk5.metric("Top Rental Market", f"{top_city}", f"{top_city_count} listings")
+
+            st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+            # Rental Visual Charts
+            r_chart_col1, r_chart_col2 = st.columns([1, 1])
+
+            with r_chart_col1:
+                st.subheader("Submarket Median Rent Comparison")
+                city_rent_stats = (
+                    raw_rentals_df.groupby("city")
+                    .agg(
+                        median_rent=("monthly_rent", "median"),
+                        count=("id", "count"),
+                        min_rent=("monthly_rent", "min"),
+                        max_rent=("monthly_rent", "max")
+                    )
+                    .reset_index()
+                    .sort_values(by="median_rent", ascending=False)
+                )
+                fig_rent_city = px.bar(
+                    city_rent_stats,
+                    x="city",
+                    y="median_rent",
+                    color="median_rent",
+                    color_continuous_scale="Viridis",
+                    text="median_rent",
+                    labels={"city": "Submarket", "median_rent": "Median Rent ($/mo)"},
+                    template="plotly_dark",
+                    hover_data=["count", "min_rent", "max_rent"]
+                )
+                fig_rent_city.update_traces(
+                    texttemplate="$%{y:,.0f}",
+                    textposition="outside",
+                    marker_line_color="rgba(255,255,255,0.2)",
+                    marker_line_width=1
+                )
+                fig_rent_city.update_layout(
+                    height=350,
+                    margin=dict(l=10, r=10, t=20, b=30),
+                    plot_bgcolor="rgba(15, 23, 42, 0.6)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    coloraxis_showscale=False,
+                    yaxis_title="Median Monthly Rent ($)"
+                )
+                st.plotly_chart(fig_rent_city, width="stretch")
+
+            with r_chart_col2:
+                st.subheader("Monthly Rent by Bedroom Count")
+                bed_df = raw_rentals_df[raw_rentals_df["beds"].notna() & (raw_rentals_df["beds"] > 0)].copy()
+                if not bed_df.empty:
+                    bed_df["beds_label"] = bed_df["beds"].apply(lambda b: f"{int(b)} Bed" if b == 1 else f"{int(b)} Beds")
+                    bed_order = sorted(bed_df["beds_label"].unique(), key=lambda x: int(x.split()[0]))
+                    fig_bed_box = px.box(
+                        bed_df,
+                        x="beds_label",
+                        y="monthly_rent",
+                        category_orders={"beds_label": bed_order},
+                        color="beds_label",
+                        labels={"beds_label": "Bedrooms", "monthly_rent": "Monthly Rent ($/mo)"},
+                        template="plotly_dark"
+                    )
+                    fig_bed_box.update_layout(
+                        height=350,
+                        margin=dict(l=10, r=10, t=20, b=30),
+                        plot_bgcolor="rgba(15, 23, 42, 0.6)",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        showlegend=False,
+                        yaxis_title="Monthly Rent ($)"
+                    )
+                    st.plotly_chart(fig_bed_box, width="stretch")
+                else:
+                    st.info("No bedroom data available for chart.")
+
+            # Sorting logic for rental cards
+            sorted_rentals = raw_rentals_df.copy()
+            if rent_sort_option == "Rent: Low to High":
+                sorted_rentals = sorted_rentals.sort_values(by="monthly_rent", ascending=True)
+            elif rent_sort_option == "Rent: High to Low":
+                sorted_rentals = sorted_rentals.sort_values(by="monthly_rent", ascending=False)
+            elif rent_sort_option == "Lowest $/SqFt":
+                sorted_rentals = sorted_rentals.sort_values(by="rent_per_sqft", ascending=True, na_position="last")
+            elif rent_sort_option == "Newest / Lowest DOM":
+                sorted_rentals = sorted_rentals.sort_values(by="days_on_market", ascending=True)
+            elif rent_sort_option == "Most Bedrooms":
+                sorted_rentals = sorted_rentals.sort_values(by="beds", ascending=False, na_position="last")
+
+            # Rental Pagination
+            total_rental_listings = len(sorted_rentals)
+
+            def _set_rentals_page(target_page: int) -> None:
+                st.session_state["rentals_page_num"] = target_page
+
+            r_pg_col1, r_pg_col2 = st.columns([1, 3])
+            with r_pg_col1:
+                r_page_size = st.selectbox(
+                    "Rentals per page",
+                    [15, 30, 50, 100],
+                    index=0,
+                    key="rentals_page_size",
+                    on_change=_set_rentals_page,
+                    args=(1,)
+                )
+            r_total_pages = max(1, -(-total_rental_listings // r_page_size))
+            r_page_num = min(max(1, int(st.session_state.get("rentals_page_num", 1))), r_total_pages)
+            st.session_state["rentals_page_num"] = r_page_num
+            r_start_idx = (r_page_num - 1) * r_page_size
+            r_end_idx = min(r_start_idx + r_page_size, total_rental_listings)
+            with r_pg_col2:
+                st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+                st.caption(f"Page **{r_page_num}** of **{r_total_pages}** · Showing **{r_start_idx + 1}–{r_end_idx}** of **{total_rental_listings}** rentals")
+
+            # Render Rental Cards
+            paged_rentals = sorted_rentals.iloc[r_start_idx:r_end_idx].to_dict(orient="records")
+            for rent in paged_rentals:
+                with st.container():
+                    rp_col1, rp_col2 = st.columns([1, 3])
+                    with rp_col1:
+                        rent_photo = rent.get("primary_photo") or "https://images.unsplash.com/photo-1545324418-cc1a3fa10c00?w=800&auto=format&fit=crop&q=60"
+                        st.image(rent_photo, width="stretch")
+                    with rp_col2:
+                        rent_badges = [
+                            f"<span style='background-color:#2563eb;color:#ffffff;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:700;display:inline-block;'>{rent['city']} ({rent['zip_code']})</span>"
+                        ]
+                        rent_style = rent.get("style") or "APARTMENT"
+                        rent_badges.append(
+                            f"<span style='background-color:#0284c7;color:#ffffff;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:700;display:inline-block;'>🏢 {rent_style.title()}</span>"
+                        )
+                        if rent.get("rent_per_sqft") and rent["rent_per_sqft"] > 0:
+                            rent_badges.append(
+                                f"<span style='background-color:#059669;color:#ffffff;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:700;display:inline-block;'>📐 ${rent['rent_per_sqft']:.2f}/sqft</span>"
+                            )
+                        rent_badges.append(
+                            "<span style='background-color:transparent;color:#f87171;border:1px solid #f87171;padding:3px 10px;border-radius:6px;font-size:12px;font-weight:700;display:inline-block;'>🔗 Source: Realtor.com · Rental Community</span>"
+                        )
+                        badges_html = f"<div style='display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;'>{''.join(rent_badges)}</div>"
+                        st.html(badges_html)
+
+                        r_min = rent.get("rent_min")
+                        r_max = rent.get("rent_max")
+                        m_rent = rent.get("monthly_rent")
+                        if r_min and r_max and r_min != r_max:
+                            rent_display = f"\\${r_min:,.0f} – \\${r_max:,.0f} / mo"
+                        elif m_rent:
+                            rent_display = f"\\${m_rent:,.0f} / mo"
+                        else:
+                            rent_display = "Contact for Rent"
+
+                        st.markdown(f"### {rent_display}")
+                        st.markdown(f"**{md_escape(rent.get('formatted_address', 'Address not disclosed'))}**")
+                        
+                        beds_val = int(rent['beds']) if rent.get('beds') is not None and not pd.isna(rent['beds']) else "-"
+                        baths_val = int(rent['full_baths']) if rent.get('full_baths') is not None and not pd.isna(rent['full_baths']) else "-"
+                        sqft_val = f"{int(rent['sqft']):,}" if rent.get('sqft') and not pd.isna(rent['sqft']) and rent['sqft'] > 0 else "-"
+                        dom_val = f"{int(rent['days_on_market'])} DOM" if rent.get('days_on_market') is not None and not pd.isna(rent['days_on_market']) else "Active"
+                        st.caption(f"🛏️ {beds_val} Beds | 🛁 {baths_val} Baths | 📐 {sqft_val} SqFt | ⏱️ {dom_val}")
+
+                        r_url = rent.get("property_url")
+                        if r_url and str(r_url).strip() and str(r_url) != "None":
+                            st.link_button("View on Realtor.com Rentals ↗", r_url, type="primary")
+                        else:
+                            st.link_button("View Submarket Rentals ↗", f"https://www.realtor.com/apartments/{rent['zip_code']}", type="secondary")
+                    st.divider()
+
+            # Bottom numbered pager for rentals
+            if r_total_pages > 1:
+                r_current_page = int(r_page_num)
+                r_window = 2
+                r_page_items = []
+                for p in range(1, r_total_pages + 1):
+                    if p == 1 or p == r_total_pages or abs(p - r_current_page) <= r_window:
+                        r_page_items.append(p)
+                    elif r_page_items and r_page_items[-1] != "…":
+                        r_page_items.append("…")
+
+                r_slots = ["prev"] + r_page_items + ["next"]
+                _, r_pager_center, _ = st.columns([1, 4, 1])
+                with r_pager_center:
+                    r_pager_cols = st.columns(len(r_slots))
+                    for i, item in enumerate(r_slots):
+                        with r_pager_cols[i]:
+                            if item == "prev":
+                                st.button(
+                                    "‹ Prev", key="rentals_pager_prev", width="stretch",
+                                    disabled=r_current_page <= 1,
+                                    on_click=_set_rentals_page, args=(r_current_page - 1,)
+                                )
+                            elif item == "next":
+                                st.button(
+                                    "Next ›", key="rentals_pager_next", width="stretch",
+                                    disabled=r_current_page >= r_total_pages,
+                                    on_click=_set_rentals_page, args=(r_current_page + 1,)
+                                )
+                            elif item == "…":
+                                st.markdown("<div style='text-align:center;padding-top:6px;color:#94a3b8;'>…</div>", unsafe_allow_html=True)
+                            else:
+                                st.button(
+                                    str(item), key=f"rentals_pager_{item}", width="stretch",
+                                    type="primary" if item == r_current_page else "secondary",
+                                    on_click=_set_rentals_page, args=(item,)
+                                )
+                st.caption(f"<div style='text-align:center;'>Page {r_current_page} of {r_total_pages} · Showing {r_start_idx + 1}–{r_end_idx} of {total_rental_listings} rentals</div>", unsafe_allow_html=True)
+
+    # ----------------------------------------------------
+    # TAB 5: Eviction & Foreclosure Trends
     # ----------------------------------------------------
     with tab_distress:
         st.subheader("⚖️ Metro Atlanta Historical Distress: Evictions & Foreclosures")
-        st.caption("Historical analysis tracking whether foreclosure pipeline rates and eviction filings are increasing across Fulton, Gwinnett, and Metro Atlanta counties over time.")
+        st.caption("Historical macro indicators tracking mortgage foreclosure pipelines and eviction court filings across Fulton, Gwinnett, and Metro Atlanta counties.")
 
         # Load historical datasets (cached for performance)
         df_ev = fetch_historical_eviction_filings()
@@ -447,38 +824,79 @@ def render_dashboard():
         ev_metrics = compute_eviction_metrics(df_ev)
         mort_metrics = compute_mortgage_delinquency_metrics(df_mort)
 
-        # 1. Executive Status Cards (Direct Answers to Key Questions)
+        # Official Source Verification & Quick-Links Toolbar
+        src_btn_col1, src_btn_col2, src_btn_col3, src_btn_col4 = st.columns(4)
+        with src_btn_col1:
+            st.link_button(
+                "🏛️ Fulton Evictions Portal ↗",
+                DATA_SOURCES["evictions"]["page_url"],
+                help="Fulton County Government Open Data Socrata Portal",
+                width="stretch"
+            )
+        with src_btn_col2:
+            st.link_button(
+                "🏦 CFPB Mortgage Trends ↗",
+                DATA_SOURCES["mortgage_delinquency"]["page_url"],
+                help="Consumer Financial Protection Bureau National Mortgage Database",
+                width="stretch"
+            )
+        with src_btn_col3:
+            st.link_button(
+                "⚖️ GA Trustee Legal Notices ↗",
+                DATA_SOURCES["ga_legal_notices"]["page_url"],
+                help="Official Georgia Foreclosure Trustee notices (RLSE Law)",
+                width="stretch"
+            )
+        with src_btn_col4:
+            st.link_button(
+                "📥 CFPB County Datasets ↗",
+                DATA_SOURCES["mortgage_delinquency"]["api_url"],
+                help="Direct CSV download portal from CFPB",
+                width="stretch"
+            )
+
+        st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
+
+        # 1. Executive Status Cards (Direct Answers to Key Questions with Verified Citations)
         col_ans_1, col_ans_2 = st.columns(2)
 
         with col_ans_1:
-            st.markdown("""
+            st.markdown(f"""
             <div style="background:linear-gradient(135deg, #1e1b4b 0%, #0f172a 100%);border:1px solid #6366f1;border-radius:12px;padding:18px;margin-bottom:16px;">
                 <div style="display:flex;justify-content:space-between;align-items:center;">
                     <span style="font-weight:700;font-size:16px;color:#a5b4fc;">⚖️ Are Eviction Filings Increasing?</span>
                     <span style="background:#ef4444;color:white;padding:3px 10px;border-radius:9999px;font-size:11px;font-weight:700;">🔴 HIGH CRISIS PLATEAU</span>
                 </div>
                 <div style="font-size:26px;font-weight:800;color:#ffffff;margin:8px 0 4px 0;">~3,100 – 3,500 / month</div>
-                <p style="color:#cbd5e1;font-size:13px;line-height:1.5;margin-bottom:0;">
+                <p style="color:#cbd5e1;font-size:13px;line-height:1.5;margin-bottom:8px;">
                     <b>Massively elevated vs. pre-pandemic baseline.</b> Fulton County filings jumped from <b>~500/mo</b> in 2016 to over <b>3,400/mo</b> in 2025–2026 (+580% surge). 
                     Metro Atlanta remains the <b>#1 eviction filing epicenter</b> nationwide (~1 in 4 renter households annually). 
-                    While recent 2026 data shows a slight plateau (-5% from peak), filing volumes remain locked at crisis levels due to cheap court filing fees ($54–$75) and institutional landlord serial filings.
+                    While recent data shows a slight plateau (-5% from peak), filing volumes remain locked at crisis levels due to cheap court filing fees ($54–$75) and institutional landlord serial filings.
                 </p>
+                <div style="border-top:1px solid rgba(99,102,241,0.3);padding-top:8px;font-size:12px;color:#a5b4fc;display:flex;justify-content:space-between;align-items:center;">
+                    <span>🔗 <b>Source:</b> <a href="{DATA_SOURCES['evictions']['page_url']}" target="_blank" style="color:#c7d2fe;text-decoration:underline;">Fulton County Courts Open Data (Dataset cbu2-qs5w) ↗</a></span>
+                    <span style="color:#94a3b8;font-size:11px;">Updated Monthly · Socrata API</span>
+                </div>
             </div>
             """, unsafe_allow_html=True)
 
         with col_ans_2:
-            st.markdown("""
+            st.markdown(f"""
             <div style="background:linear-gradient(135deg, #1e293b 0%, #0f172a 100%);border:1px solid #38bdf8;border-radius:12px;padding:18px;margin-bottom:16px;">
                 <div style="display:flex;justify-content:space-between;align-items:center;">
                     <span style="font-weight:700;font-size:16px;color:#7dd3fc;">🏛️ Are Foreclosures Increasing?</span>
                     <span style="background:#f59e0b;color:white;padding:3px 10px;border-radius:9999px;font-size:11px;font-weight:700;">🟡 STEADILY INCREASING</span>
                 </div>
                 <div style="font-size:26px;font-weight:800;color:#ffffff;margin:8px 0 4px 0;">+100% to +250% vs. 2021 Trough</div>
-                <p style="color:#cbd5e1;font-size:13px;line-height:1.5;margin-bottom:0;">
+                <p style="color:#cbd5e1;font-size:13px;line-height:1.5;margin-bottom:8px;">
                     <b>Steadily climbing year-over-year.</b> CFPB serious delinquency rates (90+ days late, the direct foreclosure pipeline) have <b>doubled in Gwinnett County</b> (0.6% in 2021 &rarr; 1.2% in 2025) 
                     and <b>more than tripled in Fulton County</b> (0.4% in 2021 &rarr; 1.4% in 2025). 
                     However, because Metro Atlanta homeowners hold substantial accumulated home equity, the overall rate remains <b>~75% below 2008 Great Recession peak levels (8.0%–9.5%)</b> as distressed owners sell on the open market.
                 </p>
+                <div style="border-top:1px solid rgba(56,189,248,0.3);padding-top:8px;font-size:12px;color:#7dd3fc;display:flex;justify-content:space-between;align-items:center;">
+                    <span>🔗 <b>Source:</b> <a href="{DATA_SOURCES['mortgage_delinquency']['page_url']}" target="_blank" style="color:#bae6fd;text-decoration:underline;">CFPB Mortgage Performance Trends (NMDB) ↗</a></span>
+                    <span style="color:#94a3b8;font-size:11px;">Quarterly Series · County Delinquency</span>
+                </div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -509,17 +927,22 @@ def render_dashboard():
 
         st.markdown("---")
 
-        # 3. Interactive Charts Section
-        tab_ev_chart, tab_mort_chart, tab_annual_chart = st.tabs([
+        # 3. Interactive Charts & Verification Section
+        tab_ev_chart, tab_mort_chart, tab_annual_chart, tab_sources_meta = st.tabs([
             "📈 Monthly Eviction Filings Timeline (2016 – 2026)",
             "🏛️ Mortgage Delinquency & Foreclosure Pipeline (2008 – 2025)",
-            "📊 Annual Totals & Multi-Year Comparison"
+            "📊 Annual Totals & Multi-Year Comparison",
+            "📚 Data Sources, Methodology & Raw Data"
         ])
 
         with tab_ev_chart:
             if not df_ev.empty:
                 st.markdown("#### Monthly Eviction Filings (Fulton County Magistrate & Superior Courts)")
-                st.caption("Official Socrata dataset from Fulton County Courts showing the surge following the 2021–2022 moratorium expirations.")
+                st.markdown(
+                    f"Official Socrata monthly dataset tracking dispossessory warrants. "
+                    f"🔗 **Primary Source Link:** [{DATA_SOURCES['evictions']['name']} ({DATA_SOURCES['evictions']['publisher']}) ↗]({DATA_SOURCES['evictions']['page_url']}) · "
+                    f"[Raw API Endpoint ↗]({DATA_SOURCES['evictions']['api_url']})"
+                )
 
                 # Calculate 3-month rolling average
                 df_ev_plot = df_ev.copy()
@@ -560,7 +983,11 @@ def render_dashboard():
         with tab_mort_chart:
             if not df_mort.empty:
                 st.markdown("#### CFPB Mortgage 90+ Days Delinquent Rate (%) by County (2008 – 2025)")
-                st.caption("Source: Consumer Financial Protection Bureau (CFPB) National Mortgage Database. Rates include seriously delinquent mortgages in active foreclosure pipeline.")
+                st.markdown(
+                    f"National Mortgage Database (NMDB) county-level time-series. "
+                    f"🔗 **Primary Source Link:** [{DATA_SOURCES['mortgage_delinquency']['name']} ({DATA_SOURCES['mortgage_delinquency']['publisher']}) ↗]({DATA_SOURCES['mortgage_delinquency']['page_url']}) · "
+                    f"[CFPB Download Portal ↗]({DATA_SOURCES['mortgage_delinquency']['api_url']})"
+                )
 
                 # County filter selector
                 selected_mort_counties = st.multiselect(
@@ -598,6 +1025,7 @@ def render_dashboard():
             col_ann_1, col_ann_2 = st.columns(2)
             with col_ann_1:
                 st.markdown("#### Annual Eviction Filings (Fulton County)")
+                st.caption(f"Source: [Fulton County Courts Open Data ↗]({DATA_SOURCES['evictions']['page_url']})")
                 if not df_ev.empty:
                     df_annual = df_ev.groupby("year")["filings"].sum().reset_index()
                     fig_ann_ev = px.bar(
@@ -615,6 +1043,7 @@ def render_dashboard():
 
             with col_ann_2:
                 st.markdown("#### 90+ Day Delinquency vs 30–89 Day Delinquency (Gwinnett & Fulton)")
+                st.caption(f"Source: [CFPB Mortgage Performance Trends ↗]({DATA_SOURCES['mortgage_delinquency']['page_url']})")
                 if not df_mort.empty:
                     recent_mort = df_mort[df_mort["county"].isin(["Gwinnett County", "Fulton County"])].groupby(["county", "year"])[["late_90_plus_pct", "late_30_89_pct"]].mean().reset_index()
                     recent_mort = recent_mort[recent_mort["year"] >= 2018]
@@ -629,6 +1058,114 @@ def render_dashboard():
                     )
                     fig_ann_mort.update_layout(height=380, margin=dict(l=20, r=20, t=30, b=20))
                     st.plotly_chart(fig_ann_mort, width="stretch")
+
+        with tab_sources_meta:
+            st.markdown("### 📚 Data Sources, Provenance & Direct Access Links")
+            st.caption("Complete attribution, update cadence, methodologies, and raw download links for all macroeconomic and distress indicators tracked in this module.")
+
+            # Fixed-height cards so both source boxes (and their buttons) align side by side
+            source_card_style = (
+                "background:#1e293b;border:1px solid #475569;border-radius:10px;padding:16px;"
+                "margin-bottom:14px;height:250px;box-sizing:border-box;overflow:auto;"
+            )
+
+            s_col1, s_col2 = st.columns(2)
+
+            with s_col1:
+                st.markdown(f"""
+                <div style="{source_card_style}">
+                    <h4 style="color:#a5b4fc;margin:0 0 8px 0;">1. {DATA_SOURCES['evictions']['name']}</h4>
+                    <p style="font-size:13px;color:#cbd5e1;line-height:1.5;">
+                        <b>Publisher:</b> {DATA_SOURCES['evictions']['publisher']}<br>
+                        <b>Geographic Scope:</b> {DATA_SOURCES['evictions']['coverage']}<br>
+                        <b>Update Cadence:</b> {DATA_SOURCES['evictions']['frequency']}<br>
+                        <b>Methodology Note:</b> {DATA_SOURCES['evictions']['notes']}
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+                st.link_button(
+                    "🔗 Open Fulton County Socrata Dataset ↗",
+                    DATA_SOURCES["evictions"]["page_url"],
+                    width="stretch",
+                    type="primary"
+                )
+
+            with s_col2:
+                st.markdown(f"""
+                <div style="{source_card_style}">
+                    <h4 style="color:#7dd3fc;margin:0 0 8px 0;">2. {DATA_SOURCES['mortgage_delinquency']['name']}</h4>
+                    <p style="font-size:13px;color:#cbd5e1;line-height:1.5;">
+                        <b>Publisher:</b> {DATA_SOURCES['mortgage_delinquency']['publisher']}<br>
+                        <b>Geographic Scope:</b> {DATA_SOURCES['mortgage_delinquency']['coverage']}<br>
+                        <b>Update Cadence:</b> {DATA_SOURCES['mortgage_delinquency']['frequency']}<br>
+                        <b>Methodology Note:</b> {DATA_SOURCES['mortgage_delinquency']['notes']}
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+                st.link_button(
+                    "🔗 Open CFPB National Mortgage Trends ↗",
+                    DATA_SOURCES["mortgage_delinquency"]["page_url"],
+                    width="stretch",
+                    type="primary"
+                )
+
+            st.markdown("---")
+
+            # Raw Data Inspector & Download section
+            st.markdown("#### 🔍 Raw Data Inspector & CSV Export")
+            data_choice = st.radio("Select Dataset to Preview:", ["Fulton County Eviction Filings", "CFPB Mortgage Delinquency Rates"], horizontal=True)
+
+            def _format_date_cols(frame: pd.DataFrame) -> pd.DataFrame:
+                """Render date-like columns as YYYY-MM-DD (drop time component)."""
+                frame = frame.copy()
+                for col in frame.columns:
+                    if col in ("date", "monthdate") or pd.api.types.is_datetime64_any_dtype(frame[col]):
+                        frame[col] = pd.to_datetime(frame[col], errors="coerce").dt.strftime("%Y-%m-%d")
+                return frame
+
+            if data_choice == "Fulton County Eviction Filings":
+                if not df_ev.empty:
+                    preview_ev = _format_date_cols(df_ev.sort_values("date", ascending=False).reset_index(drop=True))
+                    st.dataframe(
+                        preview_ev.rename(columns={
+                            "monthdate": "Month Date",
+                            "date": "Date",
+                            "month": "Month (YYYY-MM)",
+                            "filings": "Dispossessory Filings",
+                            "county": "County",
+                            "source": "Source Attribution"
+                        }),
+                        width="stretch",
+                        hide_index=True
+                    )
+                    csv_ev = preview_ev.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "📥 Download Fulton Eviction Data (CSV)",
+                        data=csv_ev,
+                        file_name="fulton_county_evictions_historical.csv",
+                        mime="text/csv"
+                    )
+            else:
+                if not df_mort.empty:
+                    preview_mort = _format_date_cols(df_mort.sort_values(["county", "date"], ascending=[True, False]).reset_index(drop=True))
+                    st.dataframe(
+                        preview_mort.rename(columns={
+                            "county": "County",
+                            "date": "Date",
+                            "month": "Month",
+                            "late_90_plus_pct": "90+ Days Late (%)",
+                            "late_30_89_pct": "30-89 Days Late (%)"
+                        }),
+                        width="stretch",
+                        hide_index=True
+                    )
+                    csv_mort = preview_mort.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "📥 Download CFPB Mortgage Delinquency Data (CSV)",
+                        data=csv_mort,
+                        file_name="cfpb_metro_atlanta_mortgage_delinquency.csv",
+                        mime="text/csv"
+                    )
 
     # ----------------------------------------------------
     # TAB 5: Price Drop Alerts & Rules (Redesigned)
@@ -985,7 +1522,7 @@ def render_dashboard():
 
     with tab_pipeline:
         st.subheader("⚡ Multi-Source Data Ingestion & Live Scraper")
-        st.caption("Ingest active MLS listings, Foreclosed/REO properties, Redfin Open Data feeds, or run synthetic seed generator.")
+        st.caption("Ingest active MLS listings, Foreclosed/REO properties, Redfin Open Data feeds, and Georgia courthouse auction notices.")
 
         col_ingest_1, col_ingest_2 = st.columns(2)
 
@@ -995,10 +1532,9 @@ def render_dashboard():
             with c1:
                 src_mls = st.checkbox("🏡 MLS / Realtor Feeds", value=True, help="Scrapes live active MLS listings via HomeHarvest")
                 src_fc = st.checkbox("⚠️ Foreclosed & Bank-Owned (REO)", value=True, help="Queries active pre-foreclosure, auction, and REO bank-owned listings")
-                src_rf = st.checkbox("📊 Redfin Open Data GIS (Option 1)", value=True, help="Fetches live public Redfin GIS CSV MLS feed for Metro Atlanta")
             with c2:
+                src_rf = st.checkbox("📊 Redfin Open Data GIS (Option 1)", value=True, help="Fetches live public Redfin GIS CSV MLS feed for Metro Atlanta")
                 src_auc = st.checkbox("🏛️ Auction.com & GA Legal Notices (Option 3)", value=True, help="Scrapes Georgia legal foreclosure notices & courthouse auction properties from official trustee feeds")
-                src_mock = st.checkbox("🧪 Synthetic Demo Seed", value=False, help="Instant offline generator for development testing")
 
             ingest_submarkets = st.multiselect("Target Submarkets", all_cities, default=["Duluth", "Suwanee", "Norcross", "Peachtree Corners"])
 
@@ -1012,8 +1548,6 @@ def render_dashboard():
                     selected_sources.append("redfin")
                 if src_auc:
                     selected_sources.append("auction")
-                if src_mock:
-                    selected_sources.append("mock")
 
                 if not selected_sources:
                     st.error("Please select at least one data source.")

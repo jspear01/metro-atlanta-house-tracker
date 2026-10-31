@@ -5,7 +5,7 @@ Data repository layer for querying and updating tracker database.
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, asc
-from src.database.models import Property, PriceHistory, AlertRule, AlertLog, IngestionSnapshot
+from src.database.models import Property, PriceHistory, AlertRule, AlertLog, IngestionSnapshot, RentalListing
 
 
 def query_properties(
@@ -96,3 +96,74 @@ def get_snapshots(session: Session, limit: int = 20) -> List[IngestionSnapshot]:
         .limit(limit)
         .all()
     )
+
+
+def query_rentals(
+    session: Session,
+    cities: Optional[List[str]] = None,
+    zip_codes: Optional[List[str]] = None,
+    min_rent: Optional[float] = None,
+    max_rent: Optional[float] = None,
+    min_beds: Optional[float] = None,
+    style: Optional[str] = None,
+    sort_by: str = "monthly_rent",
+    sort_dir: str = "asc",
+    limit: int = 500,
+    offset: int = 0
+) -> List[RentalListing]:
+    query = session.query(RentalListing)
+    if cities:
+        query = query.filter(RentalListing.city.in_(cities))
+    if zip_codes:
+        query = query.filter(RentalListing.zip_code.in_(zip_codes))
+    if min_rent is not None:
+        query = query.filter(RentalListing.monthly_rent >= min_rent)
+    if max_rent is not None:
+        query = query.filter(RentalListing.monthly_rent <= max_rent)
+    if min_beds is not None:
+        query = query.filter(RentalListing.beds >= min_beds)
+    if style and style != "All":
+        query = query.filter(RentalListing.style == style)
+
+    order_col = getattr(RentalListing, sort_by, RentalListing.monthly_rent)
+    if sort_dir.lower() == "asc":
+        query = query.order_by(asc(order_col))
+    else:
+        query = query.order_by(desc(order_col))
+
+    return query.offset(offset).limit(limit).all()
+
+
+def get_rentals_dataframe(
+    cities: Optional[List[str]] = None,
+    zip_codes: Optional[List[str]] = None,
+    min_rent: Optional[float] = None,
+    max_rent: Optional[float] = None,
+    min_beds: Optional[float] = None,
+    style: Optional[str] = None
+):
+    """Return a pandas DataFrame of filtered rental listings."""
+    from src.database.connection import get_session
+    import pandas as pd
+
+    with get_session() as session:
+        rentals = query_rentals(
+            session=session,
+            cities=cities,
+            zip_codes=zip_codes,
+            min_rent=min_rent,
+            max_rent=max_rent,
+            min_beds=min_beds,
+            style=style,
+            limit=1000
+        )
+        if not rentals:
+            return pd.DataFrame(columns=[
+                "id", "property_id", "property_url", "formatted_address", "street", "unit",
+                "city", "state", "zip_code", "county", "beds", "full_baths", "half_baths",
+                "sqft", "style", "monthly_rent", "rent_min", "rent_max", "rent_per_sqft",
+                "days_on_market", "latitude", "longitude", "primary_photo", "listing_source"
+            ])
+        data = [r.to_dict() for r in rentals]
+        return pd.DataFrame(data)
+

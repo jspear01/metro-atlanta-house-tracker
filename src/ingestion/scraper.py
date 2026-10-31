@@ -451,3 +451,136 @@ def normalize_dataframe_to_records(
             continue
 
     return records
+
+
+def normalize_rental_dataframe_to_records(
+    df: pd.DataFrame,
+    default_zip: str = "",
+    listing_source: str = "Realtor Rentals"
+) -> List[Dict[str, Any]]:
+    """Convert raw rental homeharvest DataFrame to standardized rental dictionaries."""
+    records = []
+    for _, row in df.iterrows():
+        try:
+            min_r = float(row.get("list_price_min") or 0.0) if pd.notna(row.get("list_price_min")) else None
+            max_r = float(row.get("list_price_max") or 0.0) if pd.notna(row.get("list_price_max")) else None
+            single_r = float(row.get("list_price") or 0.0) if pd.notna(row.get("list_price")) else None
+
+            # Calculate representative monthly rent
+            if single_r and single_r > 0:
+                monthly_rent = single_r
+                min_r = min_r or single_r
+                max_r = max_r or single_r
+            elif min_r and max_r and min_r > 0 and max_r > 0:
+                monthly_rent = round((min_r + max_r) / 2.0, 2)
+            elif min_r and min_r > 0:
+                monthly_rent = min_r
+                max_r = min_r
+            elif max_r and max_r > 0:
+                monthly_rent = max_r
+                min_r = max_r
+            else:
+                continue
+
+            sqft = float(row.get("sqft") or 0.0) if pd.notna(row.get("sqft")) else None
+            rent_per_sqft = round(monthly_rent / sqft, 2) if (sqft and sqft > 0) else None
+
+            city = str(row.get("city") or "").title().strip()
+            zip_code = str(row.get("zip_code") or default_zip).strip()[:5]
+
+            # Map municipality to submarket if appropriate
+            if city not in TARGET_SUBMARKETS:
+                for sm_name, sm in TARGET_SUBMARKETS.items():
+                    if zip_code in sm["zip_codes"]:
+                        city = sm_name
+                        break
+
+            county = "Gwinnett" if zip_code in ["30096", "30097", "30024", "30071", "30092", "30093"] else (
+                "Fulton" if zip_code in ["30005", "30022", "30004", "30009", "30308", "30309", "30312", "30315", "30318", "30324", "30327", "30328"] else "Forsyth"
+            )
+
+            style = str(row.get("style") or "APARTMENT").upper()
+
+            records.append({
+                "property_id": str(row.get("property_id") or row.get("listing_id") or row.get("mls_id") or ""),
+                "property_url": str(row.get("property_url") or ""),
+                "formatted_address": str(row.get("formatted_address") or f"{row.get('street', '')}, {city}, GA {zip_code}"),
+                "street": str(row.get("street") or ""),
+                "unit": str(row.get("unit") or "") if pd.notna(row.get("unit")) else None,
+                "city": city,
+                "state": "GA",
+                "zip_code": zip_code,
+                "county": county,
+                "beds": float(row.get("beds")) if pd.notna(row.get("beds")) else None,
+                "full_baths": float(row.get("full_baths")) if pd.notna(row.get("full_baths")) else None,
+                "half_baths": float(row.get("half_baths")) if pd.notna(row.get("half_baths")) else None,
+                "sqft": sqft if (sqft and sqft > 0) else None,
+                "style": style,
+                "monthly_rent": monthly_rent,
+                "rent_min": min_r,
+                "rent_max": max_r,
+                "rent_per_sqft": rent_per_sqft,
+                "days_on_market": int(row.get("days_on_mls") or 0) if pd.notna(row.get("days_on_mls")) else 0,
+                "latitude": float(row.get("latitude")) if pd.notna(row.get("latitude")) else None,
+                "longitude": float(row.get("longitude")) if pd.notna(row.get("longitude")) else None,
+                "primary_photo": str(row.get("primary_photo") or "") if pd.notna(row.get("primary_photo")) else None,
+                "listing_source": listing_source
+            })
+        except Exception as ex:
+            logger.debug(f"Row rental normalization error: {ex}")
+            continue
+
+    return records
+
+
+def scrape_apartment_rentals(
+    submarkets: Optional[List[str]] = None,
+    limit_per_zip: int = 25,
+    jitter_min: float = DEFAULT_RATE_LIMIT_MIN_SEC,
+    jitter_max: float = DEFAULT_RATE_LIMIT_MAX_SEC
+) -> List[Dict[str, Any]]:
+    """
+    Scrape live apartment and rental listings across target Metro Atlanta submarkets
+    using HomeHarvest's 'for_rent' feed with polite jitter.
+    """
+    try:
+        import homeharvest
+    except ImportError:
+        logger.error("homeharvest is not installed.")
+        return []
+
+    records: List[Dict[str, Any]] = []
+    seen_addresses = set()
+
+    zips_to_scrape = []
+    if submarkets:
+        for sm in submarkets:
+            if sm in TARGET_SUBMARKETS:
+                zips_to_scrape.extend(TARGET_SUBMARKETS[sm]["zip_codes"])
+    else:
+        zips_to_scrape = ALL_ZIP_CODES
+
+    zips_to_scrape = sorted(list(set(zips_to_scrape)))
+
+    for z in zips_to_scrape:
+        delay = random.uniform(jitter_min, jitter_max)
+        time.sleep(delay)
+        try:
+            logger.info(f"Scraping apartment rentals for ZIP {z}...")
+            df = homeharvest.scrape_property(
+                location=str(z),
+                listing_type="for_rent",
+                limit=limit_per_zip
+            )
+            if df is not None and not df.empty:
+                batch = normalize_rental_dataframe_to_records(df, default_zip=z)
+                for item in batch:
+                    addr = item.get("formatted_address")
+                    if addr and addr not in seen_addresses:
+                        seen_addresses.add(addr)
+                        records.append(item)
+        except Exception as e:
+            logger.warning(f"Error scraping rentals for ZIP {z}: {e}")
+
+    logger.info(f"Scraped total of {len(records)} apartment/rental listings.")
+    return records
