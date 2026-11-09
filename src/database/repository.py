@@ -111,11 +111,14 @@ def query_rentals(
     limit: int = 500,
     offset: int = 0
 ) -> List[RentalListing]:
-    query = session.query(RentalListing)
+    query = session.query(RentalListing).filter(RentalListing.listing_source == "Official Website")
     if cities:
         query = query.filter(RentalListing.city.in_(cities))
     if zip_codes:
         query = query.filter(RentalListing.zip_code.in_(zip_codes))
+    else:
+        from src.config import ALL_ZIP_CODES
+        query = query.filter(RentalListing.zip_code.in_(ALL_ZIP_CODES))
     if min_rent is not None:
         query = query.filter(RentalListing.monthly_rent >= min_rent)
     if max_rent is not None:

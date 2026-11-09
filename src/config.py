@@ -47,11 +47,33 @@ TARGET_SUBMARKETS = {
         "zip_codes": ["30040", "30041"],
         "center": {"lat": 34.2073, "lon": -84.1402}
     },
-    "Atlanta": {
+    "Dunwoody": {
+        "county": "DeKalb",
+        "zip_codes": ["30338", "30346", "30360"],
+        "center": {"lat": 33.9462, "lon": -84.3346}
+    },
+    "Brookhaven": {
+        "county": "DeKalb",
+        "zip_codes": ["30319", "30329", "30341"],
+        "center": {"lat": 33.8651, "lon": -84.3366}
+    },
+    "Buckhead": {
         "county": "Fulton",
-        "zip_codes": ["30308", "30309", "30312", "30315", "30316", "30317", "30318", "30324", "30327", "30328", "30331", "30342", "30349"],
-        "center": {"lat": 33.7490, "lon": -84.3880}
+        "zip_codes": ["30305", "30324", "30326", "30327", "30342"],
+        "center": {"lat": 33.8395, "lon": -84.3792}
     }
+}
+
+# Map each target ZIP to its canonical submarket & county
+ZIP_TO_SUBMARKET = {
+    z: sm_name
+    for sm_name, sm in TARGET_SUBMARKETS.items()
+    for z in sm["zip_codes"]
+}
+ZIP_TO_COUNTY = {
+    z: sm["county"]
+    for sm in TARGET_SUBMARKETS.values()
+    for z in sm["zip_codes"]
 }
 
 ALL_ZIP_CODES = sorted(list({z for sm in TARGET_SUBMARKETS.values() for z in sm["zip_codes"]}))

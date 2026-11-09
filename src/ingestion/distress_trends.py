@@ -1,11 +1,13 @@
 """
 Ingestion module for historical macro distress indicators:
 1. Fulton County / Metro Atlanta Eviction Filings (Socrata Open Data API)
-2. CFPB Mortgage Performance Trends (County-level 30-89 & 90+ days delinquent rates)
+2. Metro Atlanta county eviction filings (Princeton Eviction Lab · Eviction Tracking System)
+3. CFPB Mortgage Performance Trends (County-level 30-89 & 90+ days delinquent rates)
 """
 
 import io
 import logging
+import time
 import requests
 import pandas as pd
 from pathlib import Path
@@ -20,6 +22,20 @@ CFPB_30_89_URL = "https://files.consumerfinance.gov/data/mortgage-performance/do
 
 TARGET_COUNTIES = ["Gwinnett County", "Fulton County", "DeKalb County", "Cobb County", "Forsyth County"]
 
+# Princeton Eviction Lab · Eviction Tracking System (ETS) — tract-level monthly filings for all ETS sites
+ETS_MONTHLY_URL = "https://eviction-lab-data-downloads.s3.amazonaws.com/ets/all_sites_monthly_2020_2021.csv"
+ETS_ATLANTA_SITE = "Atlanta, GA"
+ETS_CACHE_MAX_AGE_DAYS = 7
+ETS_COUNTY_FIPS: Dict[str, str] = {
+    "13121": "Fulton County",
+    "13089": "DeKalb County",
+    "13135": "Gwinnett County",
+    "13067": "Cobb County",
+    "13063": "Clayton County",
+}
+# A county-month below this share of its trailing 6-month median is flagged as a likely reporting gap
+ETS_GAP_THRESHOLD = 0.5
+
 # Citable metadata for every external dataset shown on the distress dashboard
 DATA_SOURCES: Dict[str, Dict[str, str]] = {
     "evictions": {
@@ -29,7 +45,16 @@ DATA_SOURCES: Dict[str, Dict[str, str]] = {
         "api_url": "https://data.fultoncountyga.gov/resource/cbu2-qs5w.json",
         "coverage": "Fulton County only · monthly filings",
         "frequency": "Monthly",
-        "notes": "Counts court filings, not completed evictions. Gwinnett/DeKalb/Cobb are not included.",
+        "notes": "Counts court filings, not completed evictions. Fulton only; see the Eviction Lab source for other counties.",
+    },
+    "evictions_metro": {
+        "name": "Eviction Tracking System — Metro Atlanta County Filings",
+        "publisher": "Princeton University Eviction Lab",
+        "page_url": "https://evictionlab.org/eviction-tracking/get-the-data/",
+        "api_url": ETS_MONTHLY_URL,
+        "coverage": "Fulton, DeKalb, Gwinnett, Cobb, Clayton · census-tract level, aggregated to county · 2020–present",
+        "frequency": "Monthly (published with a ~4–5 month lag)",
+        "notes": "Counts court filings, not completed evictions. Forsyth is not covered. Sealed cases can't be assigned to a county and are excluded. Counting rules differ from the Fulton County portal, so Fulton totals won't match exactly.",
     },
     "mortgage_delinquency": {
         "name": "Mortgage Performance Trends (90+ & 30–89 Days Delinquent)",
@@ -52,7 +77,116 @@ DATA_SOURCES: Dict[str, Dict[str, str]] = {
 }
 
 # Records whether each dataset was last loaded from the live endpoint or the local cache
-FETCH_STATUS: Dict[str, str] = {"evictions": "unavailable", "mortgage_delinquency": "unavailable"}
+FETCH_STATUS: Dict[str, str] = {
+    "evictions": "unavailable",
+    "evictions_metro": "unavailable",
+    "mortgage_delinquency": "unavailable",
+}
+
+ETS_COLUMNS = ["date", "year", "month", "county", "filings", "possible_gap", "source"]
+
+
+def _aggregate_ets_atlanta(csv_source) -> pd.DataFrame:
+    """Stream the ETS all-sites CSV, keep Atlanta tracts, and aggregate filings by county & month."""
+    parts = []
+    for chunk in pd.read_csv(
+        csv_source,
+        dtype={"GEOID": str},
+        usecols=["city", "GEOID", "month", "filings_2020"],
+        chunksize=200_000,
+    ):
+        atl = chunk[chunk["city"] == ETS_ATLANTA_SITE]
+        if not atl.empty:
+            parts.append(atl)
+    if not parts:
+        return pd.DataFrame(columns=ETS_COLUMNS)
+
+    raw = pd.concat(parts, ignore_index=True)
+    raw["county"] = raw["GEOID"].str[:5].map(ETS_COUNTY_FIPS)
+    raw = raw.dropna(subset=["county"])  # drops sealed/unassignable records
+    raw["filings_2020"] = pd.to_numeric(raw["filings_2020"], errors="coerce").fillna(0)
+    raw["date"] = pd.to_datetime(raw["month"], format="%m/%Y")
+
+    agg = raw.groupby(["county", "date"], as_index=False)["filings_2020"].sum()
+    agg = agg.rename(columns={"filings_2020": "filings"})
+    agg["filings"] = agg["filings"].astype(int)
+
+    # Drop trailing months that haven't been published yet (all counties report zero)
+    monthly_total = agg.groupby("date")["filings"].sum()
+    published = monthly_total[monthly_total > 0]
+    if not published.empty:
+        agg = agg[agg["date"] <= published.index.max()]
+
+    # Flag likely reporting gaps: one county abruptly falls to a fraction of its recent run-rate while the
+    # other counties hold steady. Metro-wide drops (e.g. the 2020 CDC moratorium) are real, not gaps.
+    agg = agg.sort_values(["county", "date"]).reset_index(drop=True)
+    trailing = agg.groupby("county")["filings"].transform(
+        lambda s: s.shift(1).rolling(6, min_periods=3).median()
+    )
+    ratio = (agg["filings"] / trailing).where(trailing > 0)
+    metro_ratio = ratio.groupby(agg["date"]).transform("median")
+    agg["possible_gap"] = (ratio < ETS_GAP_THRESHOLD) & (metro_ratio >= 0.7)
+    # Once a county gaps, keep flagging until it recovers above threshold vs. its pre-gap baseline
+    for county, idx in agg.groupby("county").groups.items():
+        baseline = None
+        for i in idx:
+            if agg.at[i, "possible_gap"] and baseline is None:
+                baseline = trailing.at[i]
+            elif baseline is not None:
+                if agg.at[i, "filings"] < baseline * ETS_GAP_THRESHOLD:
+                    agg.at[i, "possible_gap"] = True
+                else:
+                    baseline = None
+
+    agg["year"] = agg["date"].dt.year
+    agg["month"] = agg["date"].dt.strftime("%Y-%m")
+    agg["source"] = "Princeton Eviction Lab · Eviction Tracking System"
+    return agg[ETS_COLUMNS]
+
+
+def fetch_metro_eviction_filings(force_refresh: bool = False) -> pd.DataFrame:
+    """
+    Fetches monthly eviction filings for Fulton, DeKalb, Gwinnett, Cobb & Clayton counties from
+    Princeton Eviction Lab's Eviction Tracking System (tract-level CSV aggregated to county).
+    The ~70 MB source file is only re-downloaded when the local aggregate is older than
+    ETS_CACHE_MAX_AGE_DAYS (or force_refresh=True).
+    Returns DataFrame with columns: ['date', 'year', 'month', 'county', 'filings', 'possible_gap', 'source']
+    """
+    cache_file = CACHE_DIR / "eviction_filings_metro_cache.csv"
+
+    def _load_cache() -> pd.DataFrame:
+        df = pd.read_csv(cache_file)
+        df["date"] = pd.to_datetime(df["date"])
+        df["possible_gap"] = df["possible_gap"].astype(str).str.lower().eq("true")
+        return df
+
+    if cache_file.exists() and not force_refresh:
+        age_days = (time.time() - cache_file.stat().st_mtime) / 86400
+        if age_days < ETS_CACHE_MAX_AGE_DAYS:
+            FETCH_STATUS["evictions_metro"] = "cache"
+            return _load_cache()
+
+    try:
+        resp = requests.get(ETS_MONTHLY_URL, timeout=90, stream=True)
+        if resp.status_code == 200:
+            resp.raw.decode_content = True
+            df = _aggregate_ets_atlanta(resp.raw)
+            if not df.empty:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                df.to_csv(cache_file, index=False)
+                logger.info(f"Aggregated {len(df)} county-month eviction records from Eviction Lab ETS.")
+                FETCH_STATUS["evictions_metro"] = "live"
+                return df
+        else:
+            logger.warning(f"Eviction Lab ETS download returned HTTP {resp.status_code}")
+    except Exception as ex:
+        logger.warning(f"Failed to fetch Eviction Lab ETS data: {ex}")
+
+    if cache_file.exists():
+        FETCH_STATUS["evictions_metro"] = "cache"
+        return _load_cache()
+
+    return pd.DataFrame(columns=ETS_COLUMNS)
 
 
 def fetch_historical_eviction_filings() -> pd.DataFrame:

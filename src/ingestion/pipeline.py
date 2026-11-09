@@ -383,6 +383,14 @@ def ingest_rental_records(records: List[Dict[str, Any]], source_name: str = "Rea
                     existing.primary_photo = rec.get("primary_photo")
                 if rec.get("property_url"):
                     existing.property_url = rec.get("property_url")
+                if rec.get("listing_source"):
+                    existing.listing_source = rec.get("listing_source")
+                if rec.get("formatted_address"):
+                    existing.formatted_address = rec.get("formatted_address")
+                if rec.get("street"):
+                    existing.street = rec.get("street")
+                if rec.get("unit"):
+                    existing.unit = rec.get("unit")
                 updated_count += 1
             else:
                 rental = RentalListing(
@@ -430,8 +438,44 @@ def run_rental_pipeline(
     limit_per_zip: int = 25
 ) -> Dict[str, Any]:
     """
-    Run scraper for apartment rentals across submarkets and ingest into rental_listings.
+    Run scraper for official apartment websites across submarkets and ingest into rental_listings.
+    (Realtor.com rental scraping has been removed in favor of official apartment websites only.)
     """
-    from src.ingestion.scraper import scrape_apartment_rentals
-    records = scrape_apartment_rentals(submarkets=submarkets, limit_per_zip=limit_per_zip)
-    return ingest_rental_records(records, source_name="Realtor Rentals")
+    return run_official_apartment_pipeline(submarkets=submarkets)
+
+
+def run_official_apartment_pipeline(
+    submarkets: Optional[List[str]] = None,
+    custom_url: Optional[str] = None,
+    custom_name: Optional[str] = None,
+    custom_city: Optional[str] = None,
+    custom_zip: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Scrape live pricing directly from official apartment community websites (SightMap API / JSON-LD)
+    and ingest into rental_listings.
+    """
+    from src.ingestion.official_apartments import (
+        scrape_all_official_apartments,
+        scrape_official_apartment_url,
+        register_custom_community
+    )
+
+    if custom_url:
+        records = scrape_official_apartment_url(
+            url=custom_url,
+            community_name=custom_name,
+            fallback_city=custom_city,
+            fallback_zip=custom_zip
+        )
+        if records and custom_city and custom_zip:
+            register_custom_community(
+                name=custom_name or records[0].get("street") or "Apartment Community",
+                url=custom_url,
+                city=custom_city,
+                zip_code=custom_zip
+            )
+    else:
+        records = scrape_all_official_apartments(submarkets=submarkets)
+
+    return ingest_rental_records(records, source_name="Official Website")

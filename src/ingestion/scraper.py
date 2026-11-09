@@ -11,6 +11,8 @@ import pandas as pd
 from src.config import (
     TARGET_SUBMARKETS,
     ALL_ZIP_CODES,
+    ZIP_TO_SUBMARKET,
+    ZIP_TO_COUNTY,
     DEFAULT_RATE_LIMIT_MIN_SEC,
     DEFAULT_RATE_LIMIT_MAX_SEC
 )
@@ -488,16 +490,15 @@ def normalize_rental_dataframe_to_records(
             city = str(row.get("city") or "").title().strip()
             zip_code = str(row.get("zip_code") or default_zip).strip()[:5]
 
-            # Map municipality to submarket if appropriate
-            if city not in TARGET_SUBMARKETS:
-                for sm_name, sm in TARGET_SUBMARKETS.items():
-                    if zip_code in sm["zip_codes"]:
-                        city = sm_name
-                        break
+            # Exclude rentals outside target submarket ZIPs (e.g., general Atlanta outside Buckhead/Brookhaven/Dunwoody)
+            if zip_code not in ALL_ZIP_CODES:
+                continue
 
-            county = "Gwinnett" if zip_code in ["30096", "30097", "30024", "30071", "30092", "30093"] else (
-                "Fulton" if zip_code in ["30005", "30022", "30004", "30009", "30308", "30309", "30312", "30315", "30318", "30324", "30327", "30328"] else "Forsyth"
-            )
+            # Map ZIP to canonical submarket (e.g. 30305/30324/30326/30327/30342 -> Buckhead, 30319 -> Brookhaven, 30338 -> Dunwoody)
+            if city not in TARGET_SUBMARKETS or city == "Atlanta":
+                city = ZIP_TO_SUBMARKET.get(zip_code, city)
+
+            county = ZIP_TO_COUNTY.get(zip_code, "Fulton")
 
             style = str(row.get("style") or "APARTMENT").upper()
 

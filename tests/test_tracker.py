@@ -3,6 +3,7 @@ Automated unit and integration test suite for Metro Atlanta Real Estate Price Tr
 """
 
 import pytest
+import pandas as pd
 from fastapi.testclient import TestClient
 
 from src.database.connection import init_db, get_session
@@ -269,6 +270,38 @@ def test_historical_distress_trends_ingestion_and_analytics():
     assert mort_kpis["Gwinnett County"]["current_90_plus_late_pct"] > 0
 
 
+def test_metro_county_eviction_aggregation():
+    import io
+    from src.ingestion.distress_trends import _aggregate_ets_atlanta, fetch_metro_eviction_filings
+
+    # Synthetic ETS rows: steady counties, one county gapping, a sealed record, a non-Atlanta site,
+    # and an unpublished trailing month (all zeros)
+    rows = ["city,type,GEOID,racial_majority,month,filings_2020,filings_avg,filings_avg_prepandemic_baseline,last_updated"]
+    for m in range(1, 9):
+        month = f"{m:02d}/2025"
+        clayton = 100 if m < 8 else 20  # August drops to 20% of run-rate -> gap
+        for geoid, val in [("13121000100", 300), ("13089000100", 200), ("13135000100", 150), ("13063000100", clayton)]:
+            rows.append(f'"Atlanta, GA",Census Tract,{geoid},Black,{month},{val},0,0,""')
+        rows.append(f'"Atlanta, GA",Census Tract,sealed,Other,{month},40,0,0,""')
+        rows.append(f'"Houston, TX",Census Tract,48201000100,Other,{month},999,0,0,""')
+    for geoid in ["13121000100", "13089000100", "13135000100", "13063000100"]:
+        rows.append(f'"Atlanta, GA",Census Tract,{geoid},Black,09/2025,0,0,0,""')
+
+    agg = _aggregate_ets_atlanta(io.StringIO("\n".join(rows)))
+    assert set(agg["county"]) == {"Fulton County", "DeKalb County", "Gwinnett County", "Clayton County"}
+    assert agg["date"].max() == pd.Timestamp("2025-08-01"), "Unpublished all-zero month should be dropped"
+    fulton_aug = agg[(agg["county"] == "Fulton County") & (agg["month"] == "2025-08")].iloc[0]
+    assert fulton_aug["filings"] == 300, "Sealed and non-Atlanta rows must be excluded"
+    gaps = agg[agg["possible_gap"]]
+    assert list(gaps["county"]) == ["Clayton County"] and list(gaps["month"]) == ["2025-08"]
+
+    # Live/cached data covers the five core metro counties
+    df = fetch_metro_eviction_filings()
+    assert not df.empty
+    assert {"Fulton County", "DeKalb County", "Gwinnett County", "Cobb County"}.issubset(set(df["county"]))
+    assert df["filings"].min() >= 0
+
+
 def test_compute_price_drop_summary_velocity():
     from src.analytics.metrics import compute_price_drop_summary
     from src.database.connection import get_session
@@ -338,11 +371,11 @@ def test_rental_pipeline_and_repository():
             "rent_min": 1750.0,
             "rent_max": 1950.0,
             "days_on_market": 5,
-            "listing_source": "Realtor Rentals"
+            "listing_source": "Official Website"
         }
     ]
 
-    res = ingest_rental_records(sample_rental, source_name="test_rentals")
+    res = ingest_rental_records(sample_rental, source_name="Official Website")
     assert res["status"] == "success"
     assert res["inserted"] == 1
 
@@ -358,6 +391,49 @@ def test_rental_pipeline_and_repository():
     with get_session() as session:
         session.query(RentalListing).filter(RentalListing.property_id == "TEST-RENTAL-001").delete()
         session.commit()
+
+
+def test_official_apartment_website_scraper():
+    from src.config import ALL_ZIP_CODES
+    from src.database.models import RentalListing
+    from src.database.repository import get_rentals_dataframe
+    from src.ingestion.official_apartments import (
+        detect_apartment_brand,
+        get_registered_communities,
+        scrape_official_apartment_url,
+    )
+
+    communities = get_registered_communities()
+    assert len(communities) >= 50
+    brands = {detect_apartment_brand(c["url"]) for c in communities}
+    assert {"MAA", "Camden", "Cortland", "AMLI", "Equity Residential"}.issubset(brands)
+    assert any(c["city"] == "Buckhead" for c in communities)
+    assert any(c["city"] == "Brookhaven" for c in communities)
+    assert any(c["city"] == "Dunwoody" for c in communities)
+    assert all(c["zip_code"] in ALL_ZIP_CODES for c in communities)
+
+    # Verify DB contains multi-brand official postings only (zero realtor.com rentals)
+    with get_session() as session:
+        non_official = session.query(RentalListing).filter(RentalListing.listing_source != "Official Website").count()
+        assert non_official == 0, "All rental listings must originate from Official Websites"
+
+    rentals_df = get_rentals_dataframe()
+    assert len(rentals_df) >= 300
+    db_brands = set(rentals_df["property_url"].apply(detect_apartment_brand).unique())
+    assert {"MAA", "Camden", "Cortland", "AMLI", "Equity Residential"}.issubset(db_brands)
+    assert set(rentals_df["zip_code"].unique()).issubset(set(ALL_ZIP_CODES))
+
+    # Test live extraction on a Camden official page
+    records = scrape_official_apartment_url(
+        url="https://www.camdenliving.com/apartments/dunwoody-ga/camden-dunwoody",
+        community_name="Camden Dunwoody",
+        fallback_city="Dunwoody",
+        fallback_zip="30338"
+    )
+    assert len(records) >= 1
+    assert records[0]["listing_source"] == "Official Website"
+    assert records[0]["monthly_rent"] > 0
+    assert records[0]["city"] == "Dunwoody"
 
 
 if __name__ == "__main__":
